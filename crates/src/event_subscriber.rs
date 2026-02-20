@@ -141,13 +141,30 @@ impl EventSubscriber {
     ) -> SdkResult<DriftEventStream> {
         grpc_log_stream(endpoint, x_token, sub_account).await
     }
+
+    /// Like [`subscribe`](Self::subscribe) but yields `(DriftEvent, slot)` tuples
+    pub async fn subscribe_with_slot(
+        ws: Arc<PubsubClient>,
+        sub_account: Pubkey,
+    ) -> SdkResult<DriftEventStreamWithSlot> {
+        log_stream_with_slot(ws, sub_account).await
+    }
+
+    /// Like [`subscribe_grpc`](Self::subscribe_grpc) but yields `(DriftEvent, slot)` tuples
+    pub async fn subscribe_grpc_with_slot(
+        endpoint: String,
+        x_token: String,
+        sub_account: Pubkey,
+    ) -> SdkResult<DriftEventStreamWithSlot> {
+        grpc_log_stream_with_slot(endpoint, x_token, sub_account).await
+    }
 }
 
 struct LogEventStream {
     cache: Arc<RwLock<TxSignatureCache>>,
     provider: Arc<PubsubClient>,
     sub_account: Pubkey,
-    event_tx: Sender<DriftEvent>,
+    event_tx: Sender<(DriftEvent, u64)>, // (event, slot)
     commitment: CommitmentConfig,
 }
 
@@ -214,10 +231,12 @@ impl LogEventStream {
         );
         for (tx_idx, log) in response.logs.iter().enumerate() {
             // a drift sub-account should not interact with any other program by definition
-            if let Some(event) = try_parse_log(log.as_str(), &signature, tx_idx) {
+            if let Some((event, slot)) =
+                try_parse_log_with_slot(log.as_str(), &signature, tx_idx, slot)
+            {
                 // unrelated events from same tx should not be emitted e.g. a filler tx which produces other fill events
                 if event.pertains_to(self.sub_account) {
-                    if self.event_tx.send(event).await.is_err() {
+                    if self.event_tx.send((event, slot)).await.is_err() {
                         warn!("event receiver closed");
                         return;
                     }
@@ -231,7 +250,7 @@ struct GrpcLogEventStream {
     grpc_endpoint: String,
     grpc_x_token: String,
     sub_account: Pubkey,
-    event_tx: Sender<DriftEvent>,
+    event_tx: Sender<(DriftEvent, u64)>, // (event, slot)
     commitment: CommitmentConfig,
 }
 
@@ -297,12 +316,15 @@ impl GrpcLogEventStream {
             target: LOG_TARGET,
             "log extracting events, slot: {}, tx: {}", event.slot, signature
         );
+        let slot = event.slot;
         let logs = &event.meta.log_messages;
         for (tx_idx, log) in logs.iter().enumerate() {
-            if let Some(event) = try_parse_log(log.as_str(), &signature.to_string(), tx_idx) {
+            if let Some((event, slot)) =
+                try_parse_log_with_slot(log.as_str(), &signature.to_string(), tx_idx, slot)
+            {
                 // unrelated events from same tx should not be emitted e.g. a filler tx which produces other fill events
                 if event.pertains_to(self.sub_account) {
-                    if self.event_tx.send(event).await.is_err() {
+                    if self.event_tx.send((event, slot)).await.is_err() {
                         warn!("event receiver closed");
                         return;
                     }
@@ -334,11 +356,34 @@ fn polled_stream(provider: impl EventRpcProvider, sub_account: Pubkey) -> DriftE
 
 /// Creates a Ws-backed event stream using `logsSubscribe` interface
 async fn log_stream(ws: Arc<PubsubClient>, sub_account: Pubkey) -> SdkResult<DriftEventStream> {
+    let s = log_stream_with_slot(ws, sub_account).await?;
+    Ok(DriftEventStream {
+        rx: s.rx,
+        task: s.task,
+    })
+}
+
+/// Creates a grpc-backed event stream
+async fn grpc_log_stream(
+    endpoint: String,
+    x_token: String,
+    sub_account: Pubkey,
+) -> SdkResult<DriftEventStream> {
+    let s = grpc_log_stream_with_slot(endpoint, x_token, sub_account).await?;
+    Ok(DriftEventStream {
+        rx: s.rx,
+        task: s.task,
+    })
+}
+
+async fn log_stream_with_slot(
+    ws: Arc<PubsubClient>,
+    sub_account: Pubkey,
+) -> SdkResult<DriftEventStreamWithSlot> {
     debug!(target: LOG_TARGET, "stream events for {sub_account:?}");
     let (event_tx, event_rx) = channel(256);
     let cache = Arc::new(RwLock::new(TxSignatureCache::new(256)));
 
-    // spawn the event subscription task
     let join_handle = tokio::spawn(async move {
         LogEventStream {
             provider: ws,
@@ -351,22 +396,20 @@ async fn log_stream(ws: Arc<PubsubClient>, sub_account: Pubkey) -> SdkResult<Dri
         .await;
     });
 
-    Ok(DriftEventStream {
+    Ok(DriftEventStreamWithSlot {
         rx: event_rx,
         task: join_handle,
     })
 }
 
-/// Creates a grpc-backed event stream
-async fn grpc_log_stream(
+async fn grpc_log_stream_with_slot(
     endpoint: String,
     x_token: String,
     sub_account: Pubkey,
-) -> SdkResult<DriftEventStream> {
+) -> SdkResult<DriftEventStreamWithSlot> {
     debug!(target: LOG_TARGET, "grpc stream events for {sub_account:?}");
     let (event_tx, event_rx) = channel(256);
 
-    // spawn the event subscription task
     let join_handle = tokio::spawn(async move {
         GrpcLogEventStream {
             grpc_endpoint: endpoint.clone(),
@@ -379,7 +422,7 @@ async fn grpc_log_stream(
         .await;
     });
 
-    Ok(DriftEventStream {
+    Ok(DriftEventStreamWithSlot {
         rx: event_rx,
         task: join_handle,
     })
@@ -387,7 +430,7 @@ async fn grpc_log_stream(
 
 pub struct PolledEventStream<T: EventRpcProvider> {
     cache: Arc<RwLock<TxSignatureCache>>,
-    event_tx: Sender<DriftEvent>,
+    event_tx: Sender<(DriftEvent, u64)>, // (event, slot)
     provider: T,
     sub_account: Pubkey,
 }
@@ -499,7 +542,7 @@ impl<T: EventRpcProvider> PolledEventStream<T> {
                         if let Some(event) = try_parse_log(log.as_str(), signature.as_str(), tx_idx)
                         {
                             if event.pertains_to(self.sub_account) {
-                                self.event_tx.try_send(event).expect("sent");
+                                self.event_tx.try_send((event, 0)).expect("sent");
                             }
                         }
                     }
@@ -514,7 +557,7 @@ pub struct DriftEventStream {
     /// handle to end the stream task
     task: JoinHandle<()>,
     /// channel of events from stream task
-    rx: Receiver<DriftEvent>,
+    rx: Receiver<(DriftEvent, u64)>,
 }
 
 impl DriftEventStream {
@@ -532,6 +575,37 @@ impl Drop for DriftEventStream {
 
 impl Stream for DriftEventStream {
     type Item = DriftEvent;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.as_mut()
+            .rx
+            .poll_recv(cx)
+            .map(|opt| opt.map(|(event, _)| event))
+    }
+}
+
+/// Like [`DriftEventStream`] but yields `(DriftEvent, slot)` tuples
+pub struct DriftEventStreamWithSlot {
+    task: JoinHandle<()>,
+    rx: Receiver<(DriftEvent, u64)>,
+}
+
+impl DriftEventStreamWithSlot {
+    pub fn unsubscribe(&self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for DriftEventStreamWithSlot {
+    fn drop(&mut self) {
+        self.unsubscribe()
+    }
+}
+
+impl Stream for DriftEventStreamWithSlot {
+    type Item = (DriftEvent, u64);
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -589,6 +663,16 @@ pub fn try_parse_log(raw: &str, signature: &str, tx_idx: usize) -> Option<DriftE
     }
 
     None
+}
+
+/// Same as [`try_parse_log`] but returns the slot alongside the event
+pub fn try_parse_log_with_slot(
+    raw: &str,
+    signature: &str,
+    tx_idx: usize,
+    slot: u64,
+) -> Option<(DriftEvent, u64)> {
+    try_parse_log(raw, signature, tx_idx).map(|event| (event, slot))
 }
 
 static ORDER_CANCEL_MISSING_RE: OnceLock<Regex> = OnceLock::new();
@@ -949,8 +1033,10 @@ mod test {
         }).await;
 
         // case 1: jit taker
+        let (event, slot) = event_rx.try_recv().expect("one event");
+        assert_eq!(slot, 338797360);
         assert_eq!(
-            event_rx.try_recv().expect("one event"),
+            event,
             DriftEvent::OrderFill {
                 maker: Some(
                     "GgZkrSFgTAXZn1rNtZ533wpZi6nxx8whJC9bxRESB22c".try_into().unwrap(),
@@ -1193,16 +1279,16 @@ mod test {
             .await;
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        assert!(event_rx.recv().await.is_some_and(|f| {
-            if let DriftEvent::OrderCreate { order, .. } = f {
+        assert!(event_rx.recv().await.is_some_and(|(event, _slot)| {
+            if let DriftEvent::OrderCreate { order, .. } = event {
                 println!("{}", order.order_id);
                 order.order_id == 1
             } else {
                 false
             }
         }));
-        assert!(event_rx.recv().await.is_some_and(|f| {
-            if let DriftEvent::OrderCreate { order, .. } = f {
+        assert!(event_rx.recv().await.is_some_and(|(event, _slot)| {
+            if let DriftEvent::OrderCreate { order, .. } = event {
                 println!("{}", order.order_id);
                 order.order_id == 2
             } else {
