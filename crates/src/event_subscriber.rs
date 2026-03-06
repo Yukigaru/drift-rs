@@ -208,8 +208,13 @@ impl LogEventStream {
     /// Process a log response from RPC, emitting any relevant events
     async fn process_log(&self, slot: u64, response: RpcLogsResponse) {
         let signature = response.signature;
-        if response.err.is_some() {
-            debug!(target: LOG_TARGET, "skipping failed tx: {signature:?}");
+        if let Some(err) = response.err {
+            debug!(target: LOG_TARGET, "failed tx: {signature:?}: {err}");
+            let event = DriftEvent::TransactionFailed {
+                signature: signature.clone(),
+                error: err.to_string(),
+            };
+            let _ = self.event_tx.send((event, slot)).await;
             return;
         }
         if signature == EMPTY_SIGNATURE {
@@ -357,10 +362,7 @@ fn polled_stream(provider: impl EventRpcProvider, sub_account: Pubkey) -> DriftE
 /// Creates a Ws-backed event stream using `logsSubscribe` interface
 async fn log_stream(ws: Arc<PubsubClient>, sub_account: Pubkey) -> SdkResult<DriftEventStream> {
     let s = log_stream_with_slot(ws, sub_account).await?;
-    Ok(DriftEventStream {
-        rx: s.rx,
-        task: s.task,
-    })
+    Ok(s.into_without_slot())
 }
 
 /// Creates a grpc-backed event stream
@@ -370,10 +372,7 @@ async fn grpc_log_stream(
     sub_account: Pubkey,
 ) -> SdkResult<DriftEventStream> {
     let s = grpc_log_stream_with_slot(endpoint, x_token, sub_account).await?;
-    Ok(DriftEventStream {
-        rx: s.rx,
-        task: s.task,
-    })
+    Ok(s.into_without_slot())
 }
 
 async fn log_stream_with_slot(
@@ -596,6 +595,20 @@ impl DriftEventStreamWithSlot {
     pub fn unsubscribe(&self) {
         self.task.abort();
     }
+
+    /// Convert into a `DriftEventStream` (discards slot info), consuming self
+    /// without triggering the Drop impl.
+    fn into_without_slot(self) -> DriftEventStream {
+        let mut s = std::mem::ManuallyDrop::new(self);
+        // Safety: we take ownership of both fields and prevent the Drop from running.
+        // The fields are valid because ManuallyDrop prevents drop.
+        unsafe {
+            DriftEventStream {
+                rx: std::ptr::read(&mut s.rx),
+                task: std::ptr::read(&mut s.task),
+            }
+        }
+    }
 }
 
 impl Drop for DriftEventStreamWithSlot {
@@ -757,6 +770,11 @@ pub enum DriftEvent {
         /// base asset amount
         amount: u64,
     },
+    /// A transaction that interacts with the drift program failed on-chain.
+    TransactionFailed {
+        signature: String,
+        error: String,
+    },
 }
 
 impl DriftEvent {
@@ -773,6 +791,7 @@ impl DriftEvent {
             Self::OrderCreate { user, .. } => *user == sub_account,
             Self::OrderExpire { user, .. } => user == subject,
             Self::OrderCancelMissing { .. } => true,
+            Self::TransactionFailed { .. } => true,
             Self::FundingPayment { user, .. } => *user == sub_account,
             Self::Swap { user, .. } => *user == sub_account,
             Self::OrderTrigger { user, .. } => *user == sub_account,
